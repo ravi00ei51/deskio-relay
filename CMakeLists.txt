@@ -1,27 +1,18 @@
 cmake_minimum_required(VERSION 3.22)
-
 project(deskio_relay LANGUAGES CXX)
-
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(Threads REQUIRED)
-
-add_executable(deskio-relay
-    src/main.cpp
-)
-
-target_link_libraries(deskio-relay
-    PRIVATE
-        Boost::system
-        Threads::Threads
-)
-
-target_compile_options(deskio-relay
-    PRIVATE
-        -Wall
-        -Wextra
-        -Wpedantic
-)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET libpqxx)
+pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
+find_package(nlohmann_json REQUIRED)
+add_library(deskio-db STATIC src/database.cpp)
+set_target_properties(deskio-db PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_link_libraries(deskio-db PRIVATE PkgConfig::PQXX PkgConfig::SODIUM nlohmann_json::nlohmann_json)
+add_executable(deskio-relay src/main.cpp)
+target_link_libraries(deskio-relay PRIVATE Boost::system Threads::Threads
+    deskio-db PkgConfig::SODIUM nlohmann_json::nlohmann_json)
+target_compile_options(deskio-relay PRIVATE -Wall -Wextra -Wpedantic)
