@@ -50,10 +50,33 @@ AuthResult database_authenticate(const Credentials& c,
             return {0, {}, {{"type", "auth.error"},
                 {"code", "invalid_credentials"}}};
         return success(rows[0][0].as<UserId>(), c.username, false);
-    } catch (const std::exception&) {
-        // Do not log exceptions that might include SQL, PII or credentials.
-        std::cerr << "Authentication database/worker operation failed\n";
-        return {0, {}, {{"type", "auth.error"},
-            {"code", "service_unavailable"}}};
-    }
+    } catch (const pqxx::broken_connection&) {
+    std::cerr << "[AUTH] PostgreSQL connection failed"
+              << std::endl;
+
+    return {0, {}, {
+        {"type", "auth.error"},
+        {"code", "service_unavailable"}
+    }};
+}
+catch (const pqxx::sql_error& error) {
+    // Log only SQLSTATE—not SQL text or personal data.
+    std::cerr << "[AUTH] PostgreSQL SQLSTATE="
+              << error.sqlstate()
+              << std::endl;
+
+    return {0, {}, {
+        {"type", "auth.error"},
+        {"code", "service_unavailable"}
+    }};
+}
+catch (const std::exception&) {
+    std::cerr << "[AUTH] Non-SQL failure during authentication"
+              << std::endl;
+
+    return {0, {}, {
+        {"type", "auth.error"},
+        {"code", "service_unavailable"}
+    }};
+}
 }
