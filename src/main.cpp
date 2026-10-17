@@ -104,6 +104,8 @@ public:
         dummy_hash_ = hash;
     }
 
+    const std::string& url() const { return url_; }
+
     AuthResult authenticate(const Credentials& c) const {
         return database_authenticate(c, url_, dummy_hash_);
     }
@@ -111,25 +113,19 @@ public:
 
 class Session;
 struct Relay {
-    std::map<UserId, std::array<std::weak_ptr<Session>, 2>> users;
-    int join(UserId id, const std::shared_ptr<Session>& session) {
-        auto& slots = users[id];
-        for (int i = 0; i < 2; ++i)
-            if (slots[i].expired()) { slots[i] = session; return i; }
-        return -1;
-    }
-    void leave(UserId id, int slot) {
-        auto found = users.find(id);
-        if (found == users.end() || slot < 0) return;
-        found->second[slot].reset();
-        if (found->second[0].expired() && found->second[1].expired())
-            users.erase(found);
-    }
-    std::shared_ptr<Session> peer(UserId id, int slot) {
-        auto found = users.find(id);
-        if (found == users.end() || slot < 0) return {};
-        return found->second[1 - slot].lock();
-    }
+    struct Device { UserId owner; std::string name; std::weak_ptr<Session> connection; };
+    struct Pending {
+        std::weak_ptr<Session> controller, target;
+        std::shared_ptr<net::steady_timer> timer;
+    };
+    std::map<std::string, Device> devices;
+    std::map<std::string, Pending> pending;
+    bool add_device(const std::shared_ptr<Session>& s, const std::string& id,
+                    const std::string& name);
+    void leave(Session* s);
+    void handle(const std::shared_ptr<Session>& s, const Json& message);
+    void finish_request(std::string id, bool accepted,
+                        const std::string& reason);
 };
 
 struct State {
@@ -160,7 +156,9 @@ class Session : public std::enable_shared_from_this<Session> {
     std::deque<std::shared_ptr<Message>> outgoing_;
     std::size_t queued_bytes_ = 0;
     UserId user_id_ = 0;
-    int slot_ = -1;
+    std::string device_id_, device_name_, username_, pending_id_, session_id_;
+    std::weak_ptr<Session> peer_;
+    friend struct Relay;
     unsigned failures_ = 0;
     bool stopped_ = false;
     Clock::time_point next_attempt_{};
@@ -180,7 +178,7 @@ private:
     void stop() {
         if (stopped_) return;
         stopped_ = true;
-        state_.relay.leave(user_id_, slot_);
+        state_.relay.leave(this);
         auth_deadline_.cancel();
         beast::error_code ignored;
         auto& socket = beast::get_lowest_layer(ws_).socket();
@@ -236,9 +234,22 @@ private:
                     self->authenticate(std::move(text));
                     return;
                 }
-                // Authenticated relay: never broadcast across accounts.
-                if (auto peer = self->state_.relay.peer(self->user_id_, self->slot_))
-                    peer->send(std::make_shared<Message>(Message{is_text, std::move(text)}));
+                if (is_text) {
+                    try {
+                        if (text.size() > 65536) throw InvalidInput("Control JSON too large");
+                        Json message = Json::parse(text);
+                        if (!message.is_object()) throw InvalidInput("Expected object");
+                        if (!self->handle_message(message)) return;
+                    } catch (const std::exception&) {
+                        self->send_json({{"type", "protocol.error"},
+                                         {"code", "invalid_request"}});
+                    }
+                } else if (!self->session_id_.empty()) {
+                    if (auto peer = self->peer_.lock())
+                        peer->send(std::make_shared<Message>(Message{false, std::move(text)}));
+                } else {
+                    self->send_json({{"type", "session.error"}, {"code", "no_active_session"}});
+                }
                 self->read();
             });
     }
@@ -284,15 +295,47 @@ private:
                         self->user_id_ = result.user_id;
                         self->auth_deadline_.cancel();
                         self->ws_.read_message_max(8 * 1024 * 1024);
-                        self->slot_ = self->state_.relay.join(result.user_id, self);
-                        result.response["relay_available"] = self->slot_ >= 0;
-                        if (self->slot_ < 0)
-                            result.response["message"] = "Account already has two relay connections";
+                        self->username_ = result.username;
+                        result.response["capabilities"] = {"devices", "sessions"};
                     }
                     self->send_json(result.response);
                     self->read();
                 });
         });
+    }
+    bool handle_message(const Json& message) {
+        const auto type = field(message, "type", 1, 40);
+        if (type != "device.register") {
+            state_.relay.handle(shared_from_this(), message);
+            return true;
+        }
+        if (!device_id_.empty()) {
+            send_json({{"type", "device.error"}, {"code", "already_registered"}});
+            return true;
+        }
+        const auto id = field(message, "device_id", 36, 36);
+        const auto name = field(message, "name", 1, 120);
+        if (!std::regex_match(id, std::regex(
+            R"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")))
+            throw InvalidInput("Expected lowercase UUID");
+        if (!state_.admit_auth()) {
+            send_json({{"type", "device.error"}, {"code", "server_busy"}});
+            return true;
+        }
+        net::post(state_.worker, [self = shared_from_this(), id, name] {
+            auto result = database_register_device(self->user_id_, id, name,
+                                                  self->state_.auth.url());
+            net::post(self->ws_.get_executor(), [self, id, name, result]() mutable {
+                --self->state_.pending_auth;
+                if (self->stopped_) return;
+                if (result.value("type", "") == "device.registered" &&
+                    !self->state_.relay.add_device(self, id, name))
+                    result = {{"type", "device.error"}, {"code", "device_already_online"}};
+                self->send_json(result);
+                self->read();
+            });
+        });
+        return false;
     }
     void send_json(const Json& object) {
         send(std::make_shared<Message>(Message{true, object.dump()}));
@@ -319,6 +362,134 @@ private:
             });
     }
 };
+
+bool Relay::add_device(const std::shared_ptr<Session>& s, const std::string& id,
+                       const std::string& name)
+{
+    auto found = devices.find(id);
+    if (found != devices.end() && !found->second.connection.expired()) return false;
+    devices[id] = Device{s->user_id_, name, s};
+    s->device_id_ = id;
+    s->device_name_ = name;
+    return true;
+}
+
+void Relay::finish_request(std::string id, bool accepted,
+                           const std::string& reason)
+{
+    auto found = pending.find(id);
+    if (found == pending.end()) return;
+    auto controller = found->second.controller.lock();
+    auto target = found->second.target.lock();
+    found->second.timer->cancel();
+    pending.erase(found);
+    if (controller) controller->pending_id_.clear();
+    if (target) target->pending_id_.clear();
+    if (accepted && controller && target && !controller->stopped_ && !target->stopped_) {
+        controller->peer_ = target;
+        target->peer_ = controller;
+        controller->session_id_ = target->session_id_ = id;
+        controller->send_json({{"type", "session.ready"}, {"session_id", id},
+            {"role", "controller"}, {"peer_device_id", target->device_id_}});
+        target->send_json({{"type", "session.ready"}, {"session_id", id},
+            {"role", "target"}, {"peer_device_id", controller->device_id_}});
+    } else {
+        Json response{{"type", "session.rejected"}, {"request_id", id},
+                      {"reason", reason}};
+        if (controller) controller->send_json(response);
+        if (target) target->send_json(response);
+    }
+}
+
+void Relay::leave(Session* s)
+{
+    if (!s->pending_id_.empty())
+        finish_request(s->pending_id_, false, "peer_disconnected");
+    if (auto peer = s->peer_.lock()) {
+        peer->peer_.reset();
+        peer->session_id_.clear();
+        peer->send_json({{"type", "session.ended"}, {"reason", "peer_disconnected"}});
+    }
+    s->peer_.reset();
+    s->session_id_.clear();
+    auto found = devices.find(s->device_id_);
+    if (found != devices.end() && found->second.connection.lock().get() == s)
+        devices.erase(found);
+}
+
+void Relay::handle(const std::shared_ptr<Session>& s, const Json& message)
+{
+    auto error = [&](const std::string& code) {
+        s->send_json({{"type", "session.error"}, {"code", code}});
+    };
+    if (s->device_id_.empty()) return error("register_device_first");
+    const auto type = field(message, "type", 1, 40);
+    if (type == "device.list") {
+        Json list = Json::array();
+        for (const auto& [id, device] : devices) {
+            auto connection = device.connection.lock();
+            if (device.owner != s->user_id_ || !connection || connection->stopped_) continue;
+            list.push_back({{"device_id", id}, {"name", device.name}, {"online", true},
+                {"is_self", id == s->device_id_},
+                {"busy", !connection->session_id_.empty() || !connection->pending_id_.empty()}});
+        }
+        s->send_json({{"type", "device.list.result"}, {"devices", list}});
+    } else if (type == "session.request") {
+        if (!s->session_id_.empty() || !s->pending_id_.empty()) return error("busy");
+        auto id = field(message, "target_device_id", 36, 36);
+        auto found = devices.find(id);
+        auto target = found == devices.end() ? nullptr : found->second.connection.lock();
+        if (!target || target->stopped_) return error("target_unavailable");
+        if (target == s) return error("cannot_control_self");
+        if (!target->session_id_.empty() || !target->pending_id_.empty()) return error("target_busy");
+        unsigned char bytes[16];
+        char encoded[33];
+        randombytes_buf(bytes, sizeof bytes);
+        sodium_bin2hex(encoded, sizeof encoded, bytes, sizeof bytes);
+        std::string request_id{encoded};
+        auto timer = std::make_shared<net::steady_timer>(s->ws_.get_executor());
+        pending.emplace(request_id, Pending{s, target, timer});
+        s->pending_id_ = target->pending_id_ = request_id;
+        timer->expires_after(std::chrono::seconds{30});
+        timer->async_wait([this, request_id](beast::error_code ec) {
+            if (!ec) finish_request(request_id, false, "expired");
+        });
+        s->send_json({{"type", "session.pending"}, {"request_id", request_id}});
+        target->send_json({{"type", "session.incoming"}, {"request_id", request_id},
+            {"requester", {{"username", s->username_}, {"device_id", s->device_id_},
+                           {"computer_name", s->device_name_}}},
+            {"expires_in_seconds", 30}});
+    } else if (type == "session.respond") {
+        auto id = field(message, "request_id", 1, 64);
+        auto found = pending.find(id);
+        if (found == pending.end() || found->second.target.lock() != s)
+            return error("invalid_approval");
+        if (!message.contains("accepted") || !message["accepted"].is_boolean())
+            throw InvalidInput("accepted must be boolean");
+        const bool accepted = message["accepted"].get<bool>();
+        finish_request(id, accepted, accepted ? "peer_disconnected" : "declined");
+    } else if (type == "session.data" || type == "session.end") {
+        if (s->session_id_.empty() ||
+            field(message, "session_id", 1, 64) != s->session_id_)
+            return error("no_active_session");
+        auto peer = s->peer_.lock();
+        if (!peer) return error("peer_disconnected");
+        if (type == "session.end") {
+            const auto session = s->session_id_;
+            s->peer_.reset(); peer->peer_.reset();
+            s->session_id_.clear(); peer->session_id_.clear();
+            const Json response{{"type", "session.ended"}, {"session_id", session},
+                                 {"reason", "ended_by_peer"}};
+            s->send_json(response); peer->send_json(response);
+        } else {
+            if (!message.contains("data")) throw InvalidInput("Missing data");
+            peer->send_json({{"type", "session.data"}, {"session_id", s->session_id_},
+                {"from_device_id", s->device_id_}, {"data", message["data"]}});
+        }
+    } else {
+        error("unsupported_message");
+    }
+}
 
 int main()
 {

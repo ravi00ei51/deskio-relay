@@ -23,3 +23,5 @@ struct AuthResult {
 AuthResult database_authenticate(const Credentials& credentials,
                                  const std::string& url,
                                  const std::string& dummy_hash);
+Json database_register_device(UserId user, const std::string& id,
+                              const std::string& name, const std::string& url);

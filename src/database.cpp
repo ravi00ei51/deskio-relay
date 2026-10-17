@@ -3,6 +3,28 @@
 #include <iostream>
 #include <stdexcept>
 
+Json database_register_device(UserId user, const std::string& id,
+                              const std::string& name, const std::string& url)
+{
+    try {
+        pqxx::connection db{url};
+        pqxx::work tx{db};
+        tx.exec("SET LOCAL statement_timeout = '10s'");
+        auto rows = tx.exec_params(
+            "INSERT INTO deskio_devices(device_id,owner_user_id,device_name) "
+            "VALUES($1,$2,$3) ON CONFLICT(device_id) DO UPDATE "
+            "SET device_name=EXCLUDED.device_name,last_seen=CURRENT_TIMESTAMP "
+            "WHERE deskio_devices.owner_user_id=EXCLUDED.owner_user_id "
+            "RETURNING device_id", id, user, name);
+        tx.commit();
+        if (rows.empty()) return {{"type", "device.error"}, {"code", "device_id_unavailable"}};
+        return {{"type", "device.registered"}, {"device_id", id}, {"name", name}};
+    } catch (const std::exception&) {
+        std::cerr << "Device database operation failed\n";
+        return {{"type", "device.error"}, {"code", "service_unavailable"}};
+    }
+}
+
 namespace {
 AuthResult success(UserId id, const std::string& username, bool created) {
     return {id, username, {{"type", "auth.success"}, {"registered", created},
@@ -50,33 +72,10 @@ AuthResult database_authenticate(const Credentials& c,
             return {0, {}, {{"type", "auth.error"},
                 {"code", "invalid_credentials"}}};
         return success(rows[0][0].as<UserId>(), c.username, false);
-    } catch (const pqxx::broken_connection&) {
-    std::cerr << "[AUTH] PostgreSQL connection failed"
-              << std::endl;
-
-    return {0, {}, {
-        {"type", "auth.error"},
-        {"code", "service_unavailable"}
-    }};
-}
-catch (const pqxx::sql_error& error) {
-    // Log only SQLSTATE—not SQL text or personal data.
-    std::cerr << "[AUTH] PostgreSQL SQLSTATE="
-              << error.sqlstate()
-              << std::endl;
-
-    return {0, {}, {
-        {"type", "auth.error"},
-        {"code", "service_unavailable"}
-    }};
-}
-catch (const std::exception&) {
-    std::cerr << "[AUTH] Non-SQL failure during authentication"
-              << std::endl;
-
-    return {0, {}, {
-        {"type", "auth.error"},
-        {"code", "service_unavailable"}
-    }};
-}
+    } catch (const std::exception&) {
+        // Do not log exceptions that might include SQL, PII or credentials.
+        std::cerr << "Authentication database/worker operation failed\n";
+        return {0, {}, {{"type", "auth.error"},
+            {"code", "service_unavailable"}}};
+    }
 }
